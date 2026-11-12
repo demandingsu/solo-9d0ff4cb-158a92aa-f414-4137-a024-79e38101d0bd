@@ -7,13 +7,25 @@
   004 33 路停运，007 撤销（整条链失效）
   005 12 路另一条独立停运（同线路独立判断），012 更正发布于查询时刻之后（不可见）
   008 5 路停运区间尚未开始
-  009 40 路停运，011 更正同时引用了不存在的 N-2026-999（无法匹配的引用）
+  009 → 011 40 路停运与更正（011 同时引用了不存在的 N-2026-999）
   013 50 路整条公告发布于查询时刻之后（时间门控）
+  014 环线（906）：停运跨过 11-12 00:00 的对照表切换，切成 906 / 907 两段标准记录
+  015 开发区专线（17 路旧名）：对照表 11-12 00:00 后无记录，尾段缺口待核实
+  016 机场线：两条有效期重叠且指向不同编号 A1/A2，整段歧义待核实
+  017 夜班专线：停运起止用 +00:00 表达，对照表边界用 +08:00，验证同一瞬间切分
   另有一个跨站详情链接，验证同站限制。
+
+线路别名对照表（见 ALIASES / demo 脚本）：
+  环线       → 906（11-01 ~ 11-12 00:00+08）/ 907（11-12 00:00+08 起）
+  开发区专线 → 17（11-01 ~ 11-12 00:00+08，之后无记录 → 缺口）
+  机场线     → A1 与 A2 有效期重叠（11-10 ~ 11-15）→ 歧义
+  夜班专线   → 901（~ 11-11T16:00Z）/ 902（11-11T16:00Z 起）
+  12 路/25 路/40 路 → 同名编号，长期有效
 """
 from __future__ import annotations
 
 import html
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,8 +88,40 @@ NOTICES: list[Notice] = [
     Notice("N-2026-013", "suspension", "50 路临时停运公告（提前发布）", "50 路",
            "2026-11-14T09:00:00+08:00", "2026-11-15T06:00:00+08:00",
            "2026-11-18T20:00:00+08:00"),
+    # 环线（906）：停运跨过 11-12 00:00 +08 的对照表切换
+    Notice("N-2026-014", "suspension", "环线临时停运公告", "环线",
+           "2026-11-09T09:00:00+08:00", "2026-11-11T05:00:00+08:00",
+           "2026-11-13T22:00:00+08:00"),
+    # 开发区专线（17 路旧名）：11-12 00:00 之后对照表无记录 → 尾段缺口
+    Notice("N-2026-015", "suspension", "开发区专线临时停运公告", "开发区专线",
+           "2026-11-09T10:00:00+08:00", "2026-11-11T05:00:00+08:00",
+           "2026-11-14T20:00:00+08:00"),
+    # 机场线：对照表两条重叠记录指向不同编号 → 整段歧义
+    Notice("N-2026-016", "suspension", "机场线临时停运公告", "机场线",
+           "2026-11-10T10:00:00+08:00", "2026-11-11T05:00:00+08:00",
+           "2026-11-14T21:00:00+08:00"),
+    # 夜班专线：公告时间用 UTC 偏移表达，对照表边界用 +08:00，验证同一瞬间切分
+    # 区间 11-11T01:00Z ~ 11-12T00:00Z；对照表切换在 11-11T16:00Z（= 11-12 00:00+08）
+    Notice("N-2026-017", "suspension", "夜班专线临时停运公告", "夜班专线",
+           "2026-11-10T20:00:00+08:00", "2026-11-11T01:00:00+00:00",
+           "2026-11-12T00:00:00+00:00"),
     Notice("N-EXT-001", "suspension", "外站转载公告（跨站链接示例）", "99 路",
            "2026-11-08T09:00:00+08:00", offsite=True),
+]
+
+# 线路别名对照表：与 demo 脚本和测试共享，保证离线示例可复现。
+# 每条为 (name, route_id, effective_from, effective_to|None)
+ALIASES: list[tuple[str, str, str, str | None]] = [
+    ("环线", "906", "2026-11-01T00:00:00+08:00", "2026-11-12T00:00:00+08:00"),
+    ("环线", "907", "2026-11-12T00:00:00+08:00", None),
+    ("开发区专线", "17", "2026-11-01T00:00:00+08:00", "2026-11-12T00:00:00+08:00"),
+    ("机场线", "A1", "2026-11-10T00:00:00+08:00", "2026-11-15T00:00:00+08:00"),
+    ("机场线", "A2", "2026-11-10T00:00:00+08:00", "2026-11-15T00:00:00+08:00"),
+    ("夜班专线", "901", "2026-11-01T00:00:00+00:00", "2026-11-11T16:00:00+00:00"),
+    ("夜班专线", "902", "2026-11-11T16:00:00+00:00", None),
+    ("12 路", "12", "2026-01-01T00:00:00+08:00", None),
+    ("25 路", "25", "2026-01-01T00:00:00+08:00", None),
+    ("40 路", "40", "2026-01-01T00:00:00+08:00", None),
 ]
 
 KIND_CN = {"suspension": "停运", "correction": "更正", "cancellation": "撤销"}
@@ -173,6 +217,18 @@ def render_list(page_notices: list[Notice], page_idx: int, total_pages: int) -> 
 """
 
 
+def paginate(notices: list[Notice]) -> list[list[Notice]]:
+    """前两页按 PAGE_SIZE 分页，其余示例公告集中在末页。
+
+    这样新增示例公告不会改变“第 3 页是末页”的既有离线样例结构。
+    """
+    head = notices[: PAGE_SIZE * 2]
+    pages = [head[i : i + PAGE_SIZE] for i in range(0, len(head), PAGE_SIZE)]
+    if len(notices) > len(head):
+        pages.append(notices[len(head) :])
+    return pages
+
+
 def build() -> None:
     if OUT_DIR.exists():
         shutil.rmtree(OUT_DIR)
@@ -182,15 +238,28 @@ def build() -> None:
     for n in real_notices:
         (OUT_DIR / detail_path(n)).write_text(render_detail(n), encoding="utf-8")
 
-    pages: list[list[Notice]] = [
-        NOTICES[i : i + PAGE_SIZE] for i in range(0, len(NOTICES), PAGE_SIZE)
-    ]
+    pages = paginate(NOTICES)
     total = len(pages)
     for idx, page_notices in enumerate(pages):
         name = "index.html" if idx == 0 else f"page{idx + 1}.html"
         (OUT_DIR / name).write_text(
             render_list(page_notices, idx, total), encoding="utf-8"
         )
+
+    # 别名对照表随示例站一并发布，调用方可直接获取后传给 /normalize
+    aliases_json = [
+        {
+            "name": name,
+            "route_id": route_id,
+            "effective_from": start,
+            "effective_to": end,
+        }
+        for name, route_id, start, end in ALIASES
+    ]
+    (OUT_DIR / "aliases.json").write_text(
+        json.dumps({"aliases": aliases_json}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     print(f"示例站点已生成: {OUT_DIR}（{len(real_notices)} 条公告，{total} 个列表页）")
 
